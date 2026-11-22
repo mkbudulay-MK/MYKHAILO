@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html lang="uk">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MyLife — температура</title>
+  <script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
+  <style>
+    :root {
+      --bg: #0c1210;
+      --surface: #141c18;
+      --surface-2: #1b2620;
+      --fg: #e7f0ea;
+      --muted: #8aa094;
+      --primary: #3dcc8a;
+      --border: #24302a;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: var(--bg);
+      color: var(--fg);
+      font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    }
+    main { max-width: 720px; margin: 0 auto; padding: 28px 16px 48px; }
+    .top { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; }
+    h1 { margin: 4px 0 0; font-size: 1.6rem; font-weight: 600; }
+    .kicker { margin: 0; color: var(--muted); font-size: 0.9rem; }
+    .pill {
+      height: 44px; display: inline-flex; align-items: center;
+      padding: 0 16px; border-radius: 999px; background: var(--surface-2);
+      color: var(--muted); font-size: 0.9rem;
+    }
+    .pill.ok { color: var(--primary); }
+    .card {
+      margin-top: 20px; background: var(--surface);
+      border: 1px solid var(--border); border-radius: 18px; padding: 22px;
+    }
+    .now { font-size: 4rem; font-weight: 650; letter-spacing: -0.04em; color: var(--primary); margin: 8px 0 0; }
+    .now span { font-size: 1.6rem; color: var(--muted); font-weight: 500; }
+    .hint { color: var(--muted); font-size: 0.9rem; margin: 8px 0 0; }
+    .row { display: flex; flex-wrap: wrap; gap: 8px; margin: 4px 0 14px; }
+    button {
+      height: 44px; border-radius: 999px; border: 1px solid var(--border);
+      background: var(--surface-2); color: var(--fg); padding: 0 16px; font-size: 0.9rem;
+    }
+    button.on { background: var(--primary); color: var(--bg); border-color: var(--primary); font-weight: 600; }
+    canvas { width: 100%; height: 260px; display: block; }
+    .stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-top: 14px; }
+    .stat { background: var(--surface-2); border-radius: 12px; padding: 12px; }
+    .stat b { display: block; margin-top: 4px; font-size: 1.15rem; font-weight: 600; }
+    .stat span, .fine, .topic { color: var(--muted); }
+    .fine, .topic { font-size: 0.75rem; line-height: 1.45; }
+    .topic { margin-top: 16px; word-break: break-all; }
+    .empty {
+      height: 260px; display: flex; align-items: center; justify-content: center;
+      text-align: center; color: var(--muted); border: 1px dashed var(--border); border-radius: 12px; padding: 16px;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <div class="top">
+      <div>
+        <p class="kicker">MyLife</p>
+        <h1>Температура</h1>
+      </div>
+      <span class="pill" id="status">Підключення</span>
+    </div>
+
+    <section class="card">
+      <div class="hint">Зараз</div>
+      <p class="now" id="temp">—<span> °C</span></p>
+      <p class="hint" id="when">Очікую дані з ESP32</p>
+    </section>
+
+    <section class="card">
+      <h2 style="margin:0 0 12px; font-size:1rem; font-weight:600;">Графік</h2>
+      <div class="row" id="periods"></div>
+      <canvas id="chart" width="680" height="260" hidden></canvas>
+      <div class="empty" id="empty">Ще немає точок за цей період. Залиште сторінку відкритою, поки ESP32 надсилає температуру.</div>
+      <div class="stats">
+        <div class="stat"><span>Мін</span><b id="min">—</b></div>
+        <div class="stat"><span>Середня</span><b id="avg">—</b></div>
+        <div class="stat"><span>Макс</span><b id="max">—</b></div>
+      </div>
+      <p class="fine">Брокер не зберігає історію. Графік збирається в цьому браузері і лишається після оновлення сторінки.</p>
+    </section>
+    <p class="topic">home/userMy19870529_esp32/temperature</p>
+  </main>
+  <script>
+    const TOPIC = "home/userMy19870529_esp32/temperature";
+    const BROKER = "wss://broker.emqx.io:8084/mqtt";
+    const KEY = "mylife.temp.v1";
+    const WEEK = 7 * 24 * 60 * 60 * 1000;
+    const PERIODS = [
+      { id: "15m", label: "15 хв", ms: 15 * 60 * 1000 },
+      { id: "1h", label: "1 год", ms: 60 * 60 * 1000 },
+      { id: "6h", label: "6 год", ms: 6 * 60 * 60 * 1000 },
+      { id: "24h", label: "24 год", ms: 24 * 60 * 60 * 1000 },
+      { id: "7d", label: "7 днів", ms: WEEK },
+    ];
+    let period = "1h";
+    let history = load();
+
+    const statusEl = document.getElementById("status");
+    const tempEl = document.getElementById("temp");
+    const whenEl = document.getElementById("when");
+    const canvas = document.getElementById("chart");
+    const emptyEl = document.getElementById("empty");
+
+    function load() {
+      try {
+        const raw = JSON.parse(localStorage.getItem(KEY) || "[]");
+        const cutoff = Date.now() - WEEK;
+        return Array.isArray(raw) ? raw.filter((p) => p && p.t >= cutoff && Number.isFinite(p.v)) : [];
+      } catch { return []; }
+    }
+    function save() {
+      try { localStorage.setItem(KEY, JSON.stringify(history.slice(-4000))); } catch {}
+    }
+    function parseTemp(text) {
+      text = String(text).trim();
+      const direct = Number(text.replace(",", "."));
+      if (Number.isFinite(direct)) return direct;
+      try {
+        const json = JSON.parse(text);
+        for (const key of ["temperature", "temp", "value", "c"]) {
+          const n = Number(json[key]);
+          if (Number.isFinite(n)) return n;
+        }
+      } catch {}
+      const m = text.match(/-?\d+(?:[.,]\d+)?/);
+      return m ? Number(m[0].replace(",", ".")) : null;
+    }
+    function add(value) {
+      const now = Date.now();
+      const last = history[history.length - 1];
+      if (last && now - last.t < 10000) history[history.length - 1] = { t: now, v: value };
+      else history.push({ t: now, v: value });
+      history = history.filter((p) => p.t >= now - WEEK).slice(-4000);
+      save();
+      render();
+    }
+    function visible() {
+      const ms = PERIODS.find((p) => p.id === period).ms;
+      const from = Date.now() - ms;
+      return history.filter((p) => p.t >= from);
+    }
+    function fmt(ts) {
+      return new Date(ts).toLocaleString("uk-UA", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" });
+    }
+    function render() {
+      const points = visible();
+      const latest = history[history.length - 1];
+      tempEl.innerHTML = (latest ? latest.v.toFixed(1) : "—") + "<span> °C</span>";
+      whenEl.textContent = latest ? "Останнє повідомлення " + fmt(latest.t) : "Очікую дані з ESP32";
+      const set = (id, n) => { document.getElementById(id).textContent = n == null ? "—" : n.toFixed(1) + "°"; };
+      if (!points.length) {
+        set("min", null); set("avg", null); set("max", null);
+        canvas.hidden = true; emptyEl.hidden = false;
+        return;
+      }
+      let min = points[0].v, max = points[0].v, sum = 0;
+      for (const p of points) { min = Math.min(min, p.v); max = Math.max(max, p.v); sum += p.v; }
+      set("min", min); set("avg", sum / points.length); set("max", max);
+      canvas.hidden = false; emptyEl.hidden = true;
+      draw(points);
+    }
+    function draw(points) {
+      const dpr = window.devicePixelRatio || 1;
+      const w = canvas.clientWidth || 680;
+      const h = 260;
+      canvas.width = Math.floor(w * dpr);
+      canvas.height = Math.floor(h * dpr);
+      const ctx = canvas.getContext("2d");
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.clearRect(0, 0, w, h);
+      const pad = { l: 42, r: 12, t: 12, b: 28 };
+      const ms = PERIODS.find((p) => p.id === period).ms;
+      const t1 = Date.now(), t0 = t1 - ms;
+      let min = Math.min(...points.map((p) => p.v));
+      let max = Math.max(...points.map((p) => p.v));
+      if (max - min < 1) { min -= 0.5; max += 0.5; }
+      const x = (t) => pad.l + ((t - t0) / (t1 - t0)) * (w - pad.l - pad.r);
+      const y = (v) => pad.t + (1 - (v - min) / (max - min)) * (h - pad.t - pad.b);
+      ctx.strokeStyle = "#24302a"; ctx.lineWidth = 1;
+      ctx.fillStyle = "#8aa094"; ctx.font = "12px system-ui";
+      for (let i = 0; i < 4; i++) {
+        const v = min + ((max - min) * i) / 3;
+        const yy = y(v);
+        ctx.beginPath(); ctx.moveTo(pad.l, yy); ctx.lineTo(w - pad.r, yy); ctx.stroke();
+        ctx.fillText(v.toFixed(1) + "°", 2, yy + 4);
+      }
+      ctx.beginPath();
+      points.forEach((p, i) => { const px = x(p.t), py = y(p.v); i ? ctx.lineTo(px, py) : ctx.moveTo(px, py); });
+      ctx.strokeStyle = "#3dcc8a"; ctx.lineWidth = 2; ctx.stroke();
+      ctx.lineTo(x(points[points.length - 1].t), h - pad.b);
+      ctx.lineTo(x(points[0].t), h - pad.b);
+      ctx.closePath();
+      ctx.fillStyle = "rgba(61,204,138,0.18)";
+      ctx.fill();
+      if (points.length < 12) {
+        ctx.fillStyle = "#3dcc8a";
+        for (const p of points) { ctx.beginPath(); ctx.arc(x(p.t), y(p.v), 4, 0, Math.PI * 2); ctx.fill(); }
+      }
+      ctx.fillStyle = "#8aa094";
+      ctx.fillText(fmt(t0), pad.l, h - 6);
+      const end = fmt(t1);
+      ctx.fillText(end, w - pad.r - ctx.measureText(end).width, h - 6);
+    }
+
+    const periodsEl = document.getElementById("periods");
+    for (const item of PERIODS) {
+      const b = document.createElement("button");
+      b.textContent = item.label;
+      b.className = item.id === period ? "on" : "";
+      b.onclick = () => {
+        period = item.id;
+        for (const child of periodsEl.children) child.className = child === b ? "on" : "";
+        render();
+      };
+      periodsEl.appendChild(b);
+    }
+
+    const client = mqtt.connect(BROKER, {
+      clientId: "mylife_" + Math.random().toString(16).slice(2, 10),
+      clean: true, reconnectPeriod: 3000, connectTimeout: 10000, protocolVersion: 4,
+    });
+    client.on("connect", () => { statusEl.textContent = "Онлайн"; statusEl.className = "pill ok"; client.subscribe(TOPIC); });
+    client.on("reconnect", () => { statusEl.textContent = "Підключення"; statusEl.className = "pill"; });
+    client.on("offline", () => { statusEl.textContent = "Немає зв’язку"; statusEl.className = "pill"; });
+    client.on("error", () => { statusEl.textContent = "Помилка"; statusEl.className = "pill"; });
+    client.on("message", (_topic, payload) => {
+      const value = parseTemp(payload.toString());
+      if (value != null) add(value);
+    });
+    window.addEventListener("resize", render);
+    render();
+  </script>
+</body>
+</html>
